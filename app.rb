@@ -1,12 +1,22 @@
 
 require "fileutils"
 require "json"
-require_relative "gui"
+require "open3"
+require "tempfile"
+require "tmpdir"
+
+begin
+  require_relative "gui"
+rescue LoadError
+  # GUI is optional until import gui.
+end
 
 class Language
   MAX_INT = 2_147_483_647
   MAX_LONG = 9_223_372_036_854_775_807
-  MAX_LONG_LONG = 10_000_000_000_000_000_000
+  MAX_LONG_LONG = 10_000_000_000_000_000_000_000
+
+  TYPES = %w[vs vf vi vb vl vll va].freeze
 
   PRECEDENCE = {
     "||" => 1,
@@ -24,8 +34,6 @@ class Language
     "%" => 6
   }.freeze
 
-  TYPES = %w[vs vf vi vb vl vll].freeze
-
   class ReturnSignal < StandardError
     attr_reader :value
 
@@ -41,18 +49,25 @@ class Language
     @namespaces = {}
     @classes = {}
     @imports = {}
+    @extensions = {}
+    @keywords = {}
+
     @time_imported = false
     @gui_imported = false
-    @call_depth = 0
+
     @tokens = []
     @position = 0
+    @call_depth = 0
     @source_file = nil
-    @current_line = nil
     @error_count = 0
   end
 
+  # ==========================================================
+  # EXPRESSIONS
+  # ==========================================================
+
   def tokenize(source)
-    pattern = /\G\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\d+(?:\.\d+)?|[A-Za-z_]\w*|::|==|!=|<=|>=|&&|\|\||[.()+*\/%!,<>-])/
+    pattern = /\G\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\d+(?:\.\d+)?|[A-Za-z_]\w*|::|==|!=|<=|>=|&&|\|\||[\[\](),.+*\/%!<>-])/
 
     tokens = []
     offset = 0
@@ -62,9 +77,7 @@ class Language
 
       unless match && match.begin(0) == offset
         break if source[offset..].strip.empty?
-
-        raise SyntaxError,
-              "Invalid expression: #{source[offset..]}"
+        raise SyntaxError, "Invalid expression near #{source[offset..]}"
       end
 
       tokens << match[1]
@@ -88,8 +101,7 @@ class Language
     actual = take
 
     unless actual == value
-      raise SyntaxError,
-            "Expected #{value}, got #{actual.inspect}"
+      raise SyntaxError, "Expected #{value}, got #{actual.inspect}"
     end
 
     actual
@@ -114,6 +126,8 @@ class Language
     @tokens = tokenize(source.to_s)
     @position = 0
 
+    return nil if @tokens.empty?
+
     result = expression(0)
 
     if peek
@@ -127,7 +141,6 @@ class Language
   end
 
   def decode_string(token)
-    quote = token[0]
     text = token[1...-1]
 
     text.gsub(/\\([ntr"'\\])/) do
@@ -156,14 +169,28 @@ class Language
         expect(")")
         value
 
+      when "["
+        values = []
+
+        unless peek == "]"
+          loop do
+            values << expression(0)
+            break unless peek == ","
+            take
+          end
+        end
+
+        expect("]")
+        values
+
       when "-"
         -numeric(expression(7))
 
-      when "!"
-        !truthy?(expression(7))
-
       when "+"
         numeric(expression(7))
+
+      when "!"
+        !truthy?(expression(7))
 
       when /\A\d+\.\d+\z/
         token.to_f
@@ -185,7 +212,7 @@ class Language
 
       else
         unless token.match?(/\A[A-Za-z_]\w*\z/)
-          raise SyntaxError, "Unexpected #{token}"
+          raise SyntaxError, "Unexpected token #{token}"
         end
 
         if peek == "." || peek == "::"
@@ -198,7 +225,6 @@ class Language
 
           expect("(")
           args = parse_arguments
-
           scoped_call(token, separator, method, args)
 
         elsif peek == "("
@@ -215,6 +241,47 @@ class Language
         end
       end
 
+    # Postfix array indexing and value methods.
+    loop do
+      if peek == "["
+        take
+        index = evaluate_index
+        expect("]")
+
+        unless left.is_a?(Array) || left.is_a?(String)
+          raise TypeError, "Cannot index #{left.class}"
+        end
+
+        left = left.fetch(index)
+
+      elsif peek == "."
+        take
+        method = take
+
+        case method
+        when "its", "to_s", "str"
+          left = left.to_s
+        when "to_i", "int"
+          left = Integer(left)
+        when "to_f", "float"
+          left = Float(left)
+        when "length", "size"
+          left = left.length
+        when "first"
+          left = left.first
+        when "last"
+          left = left.last
+        when "reverse"
+          left = left.reverse
+        else
+          raise NameError, "Unknown value method #{method}"
+        end
+
+      else
+        break
+      end
+    end
+
     while (operator = peek) &&
           PRECEDENCE.fetch(operator, -1) >= minimum
 
@@ -228,15 +295,23 @@ class Language
     left
   end
 
+  def evaluate_index
+    index = expression(0)
+
+    unless index.is_a?(Integer)
+      raise TypeError, "Array index must be an integer"
+    end
+
+    index
+  end
+
   def parse_arguments
     args = []
 
     unless peek == ")"
       loop do
         args << expression(0)
-
         break unless peek == ","
-
         take
       end
     end
@@ -248,7 +323,9 @@ class Language
   def calculate(a, operator, b)
     case operator
     when "+"
-      if a.is_a?(String) || b.is_a?(String)
+      if a.is_a?(Array) && b.is_a?(Array)
+        a + b
+      elsif a.is_a?(String) || b.is_a?(String)
         a.to_s + b.to_s
       else
         numeric(a) + numeric(b)
@@ -263,17 +340,13 @@ class Language
     when "/"
       numeric(a)
       numeric(b)
-
       raise ZeroDivisionError, "Division by zero" if b == 0
-
       a.fdiv(b)
 
     when "%"
       numeric(a)
       numeric(b)
-
       raise ZeroDivisionError, "Modulo by zero" if b == 0
-
       a % b
 
     when "=="
@@ -287,9 +360,7 @@ class Language
         (a.is_a?(Numeric) && b.is_a?(Numeric)) ||
         (a.is_a?(String) && b.is_a?(String))
 
-      unless compatible
-        raise TypeError, "Incompatible comparison"
-      end
+      raise TypeError, "Incompatible comparison" unless compatible
 
       a.public_send(operator, b)
 
@@ -304,31 +375,33 @@ class Language
     end
   end
 
+  # ==========================================================
+  # VARIABLES AND ARRAYS
+  # ==========================================================
+
   def assign(name, value, type = nil)
     unless name.match?(/\A[A-Za-z_]\w*\z/)
       raise SyntaxError, "Invalid variable name #{name}"
     end
 
-    if type.nil? && @variables.key?(name)
+    if type.nil?
+      unless @variables.key?(name)
+        raise NameError, "Unknown variable #{name}"
+      end
+
       type = @variables[name][:type]
-    elsif type.nil?
-      raise NameError, "Unknown variable #{name}"
     end
 
     case type
     when "vs"
-      unless value.is_a?(String)
-        raise TypeError, "Expected string for #{name}"
-      end
+      raise TypeError, "Expected string" unless value.is_a?(String)
 
     when "vf"
       numeric(value)
       value = value.to_f
 
     when "vi", "vl", "vll"
-      unless value.is_a?(Integer)
-        raise TypeError, "Expected integer for #{name}"
-      end
+      raise TypeError, "Expected integer" unless value.is_a?(Integer)
 
       maximum = {
         "vi" => MAX_INT,
@@ -337,20 +410,22 @@ class Language
       }.fetch(type)
 
       if value.abs > maximum
-        raise RangeError,
-              "#{type} overflow (max #{maximum})"
+        raise RangeError, "#{type} overflow (max #{maximum})"
       end
 
     when "vb"
       unless value == true || value == false
-        raise TypeError, "Expected boolean for #{name}"
+        raise TypeError, "Expected boolean"
       end
 
+    when "va"
+      raise TypeError, "Expected array" unless value.is_a?(Array)
+
     when nil
-      # Untyped function parameter.
+      # Untyped function parameters.
 
     else
-      raise TypeError, "Unknown variable type #{type}"
+      raise TypeError, "Unknown type #{type}"
     end
 
     @variables[name] = {
@@ -361,12 +436,35 @@ class Language
     value
   end
 
+  def set_array_item(name, index, value)
+    entry = @variables[name]
+
+    raise NameError, "Unknown array #{name}" unless entry
+    raise TypeError, "#{name} is not an array" unless entry[:value].is_a?(Array)
+
+    index = Integer(index)
+
+    if index < 0
+      raise RangeError, "Negative array assignment index"
+    end
+
+    if index > 1_000_000
+      raise RangeError, "Array index too large"
+    end
+
+    entry[:value][index] = value
+    value
+  end
+
+  # ==========================================================
+  # INPUT
+  # ==========================================================
+
   def read_input(prompt = "")
     print prompt
     STDOUT.flush
 
     value = STDIN.gets
-
     raise EOFError, "End of input" unless value
 
     value.chomp
@@ -376,17 +474,13 @@ class Language
     case type
     when "vi", "vl", "vll"
       Integer(value)
-
     when "vf"
       Float(value)
-
     when "vb"
       unless %w[true false].include?(value)
         raise ArgumentError, "Expected true or false"
       end
-
       value == "true"
-
     else
       value
     end
@@ -403,10 +497,591 @@ class Language
       raise TypeError, "Input prompt must be a string"
     end
 
-    value = read_input(prompt)
-
-    convert_input(value, type)
+    convert_input(read_input(prompt), type)
   end
+
+  # ==========================================================
+  # INTERPOLATION
+  # ==========================================================
+
+  def interpolate(text)
+    # Rublang interpolation:
+    # "Hello $&{name}"
+    # "Count $&{count.its}"
+
+    text.gsub(/\$&\{([^{}]+)\}/) do
+      source = Regexp.last_match(1).strip
+
+      if source =~ /\A(.+)\.its\s*\(.*\)\z/
+        source = Regexp.last_match(1)
+        evaluate(source).to_s
+      else
+        evaluate(source).to_s
+      end
+    end
+  end
+
+  def display_value(source)
+    value = evaluate(source)
+
+    if value.is_a?(String)
+      interpolate(value)
+    else
+      value
+    end
+  end
+
+  # ==========================================================
+  # BUILT-IN FUNCTIONS
+  # ==========================================================
+
+  def fib(n)
+    n = Integer(n)
+
+    raise RangeError, "Negative Fibonacci index" if n < 0
+    raise RangeError, "Fibonacci index too large" if n > 100_000
+
+    a = 0
+    b = 1
+
+    n.times do
+      a, b = b, a + b
+    end
+
+    a
+  end
+
+  def call_function(name, args)
+    case name
+    when "print"
+      puts(*args)
+      return nil
+
+    when "str"
+      check_args(name, args, 1)
+      return args[0].to_s
+
+    when "int"
+      check_args(name, args, 1)
+      return Integer(args[0])
+
+    when "float"
+      check_args(name, args, 1)
+      return Float(args[0])
+
+    when "len"
+      check_args(name, args, 1)
+      return args[0].length
+
+    when "abs"
+      check_args(name, args, 1)
+      return numeric(args[0]).abs
+
+    when "min"
+      check_args(name, args, 2)
+      return args.min
+
+    when "max"
+      check_args(name, args, 2)
+      return args.max
+
+    when "round"
+      check_args(name, args, 1)
+      return numeric(args[0]).round
+
+    when "fib"
+      check_args(name, args, 1)
+      return fib(args[0])
+
+    when "push"
+      check_args(name, args, 2)
+      raise TypeError, "Expected array" unless args[0].is_a?(Array)
+      args[0] << args[1]
+      return args[0]
+
+    when "pop"
+      check_args(name, args, 1)
+      raise TypeError, "Expected array" unless args[0].is_a?(Array)
+      return args[0].pop
+
+    when "range"
+      check_args(name, args, 2)
+      return (Integer(args[0])..Integer(args[1])).to_a
+    end
+
+    function = @functions[name]
+
+    raise NameError, "Unknown function #{name}" unless function
+
+    invoke_function(function, args, name)
+  end
+
+  def check_args(name, args, expected)
+    unless args.length == expected
+      raise ArgumentError, "#{name} expects #{expected} arguments"
+    end
+  end
+
+  # ==========================================================
+  # FUNCTIONS, CLASSES, NAMESPACES
+  # ==========================================================
+
+  def parameters(source)
+    return [] if source.strip.empty?
+
+    params = source.split(",").map(&:strip)
+
+    valid = params.all? do |param|
+      param.match?(/\A[A-Za-z_]\w*\z/)
+    end
+
+    unless valid && params.uniq == params
+      raise SyntaxError, "Invalid function parameters"
+    end
+
+    params
+  end
+
+  def invoke_function(function, args, name)
+    expected = function[:params].length
+
+    unless args.length == expected
+      raise ArgumentError, "#{name} expects #{expected} arguments"
+    end
+
+    if @call_depth >= 100
+      raise RangeError, "Function recursion limit reached"
+    end
+
+    previous = @variables
+    @variables = previous.dup
+    @call_depth += 1
+
+    function[:params].zip(args).each do |param, value|
+      @variables[param] = {
+        type: nil,
+        value: value
+      }
+    end
+
+    begin
+      execute(function[:body], true)
+      nil
+    rescue ReturnSignal => signal
+      signal.value
+    ensure
+      @variables.each do |key, entry|
+        if previous.key?(key) &&
+           !function[:params].include?(key)
+          previous[key] = entry
+        end
+      end
+
+      @variables = previous
+      @call_depth -= 1
+    end
+  end
+
+  def define_scope(kind, name, body)
+    table = kind == "namespace" ? @namespaces : @classes
+    table[name] ||= {}
+
+    index = 0
+
+    while index < body.length
+      line = body[index][:text]
+
+      if line.empty? || comment_line?(line)
+        index += 1
+        next
+      end
+
+      match = /\Adef\s+([A-Za-z_]\w*)\s*\(([^()]*)\)\s*\z/.match(line)
+
+      unless match
+        raise SyntaxError, "Only methods allowed inside #{kind} #{name}"
+      end
+
+      method_name = match[1]
+      params = parameters(match[2])
+
+      method_body, last, middle = extract_block(body, index)
+
+      raise SyntaxError, "Unexpected else" if middle
+
+      table[name][method_name] = {
+        params: params,
+        body: method_body
+      }
+
+      index = last + 1
+    end
+  end
+
+  def scoped_call(owner, separator, method, args)
+    if owner == "GUI" && separator == "::"
+      raise NameError, "Import gui first" unless @gui_imported
+      raise LoadError, "GUI engine unavailable" unless defined?(RublangGUI)
+
+      return RublangGUI.call(method, args)
+    end
+
+    if owner == "time" && separator == "."
+      raise NameError, "Import time first" unless @time_imported
+
+      if method == "sleep"
+        check_args("time.sleep", args, 1)
+        seconds = numeric(args[0])
+        raise RangeError, "Negative sleep" if seconds < 0
+        sleep(seconds)
+        return nil
+      end
+    end
+
+    table = separator == "." ? @namespaces : @classes
+    scope = table[owner]
+
+    unless scope
+      raise NameError, "Unknown scope #{owner}"
+    end
+
+    function = scope[method]
+
+    unless function
+      raise NameError, "Unknown method #{owner}#{separator}#{method}"
+    end
+
+    invoke_function(function, args, "#{owner}#{separator}#{method}")
+  end
+
+  # ==========================================================
+  # IMPORTS
+  # ==========================================================
+
+  def import_package(name)
+    return if @imports[name]
+
+    case name
+    when "time"
+      @time_imported = true
+      @imports[name] = true
+      return
+
+    when "gui"
+      raise LoadError, "GUI engine unavailable" unless defined?(RublangGUI)
+      @gui_imported = true
+      @imports[name] = true
+      return
+    end
+
+    unless name.match?(/\A[A-Za-z][A-Za-z0-9_-]*\z/)
+      raise SyntaxError, "Invalid package name #{name}"
+    end
+
+    directories = [Dir.pwd]
+    directories.unshift(File.dirname(@source_file)) if @source_file
+
+    paths = directories.uniq.flat_map do |directory|
+      [
+        File.join(directory, ".rublang", "packages", "#{name}.lang"),
+        File.join(directory, ".rublang", "packages", name, "main.lang"),
+        File.join(directory, "#{name}.lang")
+      ]
+    end
+
+    path = paths.find { |candidate| File.file?(candidate) }
+
+    unless path
+      raise LoadError, "Package not installed: #{name}. Run ruby pkg.rb install ."
+    end
+
+    @imports[name] = true
+
+    begin
+      run(File.read(path))
+    rescue Exception
+      @imports.delete(name)
+      raise
+    end
+  end
+
+  # ==========================================================
+  # COMMENTS
+  # ==========================================================
+
+  def comment_line?(line)
+    line.start_with?("#", "//", "---")
+  end
+
+  def remove_comments(code)
+    result = []
+    in_comment = false
+
+    code.each_line do |line|
+      stripped = line.strip
+
+      if in_comment
+        if stripped.include?("+++")
+          in_comment = false
+          rest = stripped.split("+++", 2)[1].to_s
+          result << rest + "\n"
+        else
+          result << "\n"
+        end
+        next
+      end
+
+      if stripped.start_with?("---")
+        if stripped.include?("+++")
+          rest = stripped.split("+++", 2)[1].to_s
+          result << rest + "\n"
+        else
+          in_comment = true
+          result << "\n"
+        end
+      elsif stripped.start_with?("#", "//")
+        result << "\n"
+      else
+        result << line
+      end
+    end
+
+    result.join
+  end
+
+  # ==========================================================
+  # BLOCKS
+  # ==========================================================
+
+  def block_start?(line)
+    return true if line.match?(/\A(?:if|while|def|namespace|class)\s+/)
+    return true if line.match?(/\Atimes\s*\(.+\)\s+as\s+\w+\s*\{\s*\z/)
+    return true if line.match?(/\Akeyword\s*\(.+\)\s*\{\s*\z/)
+    return true if line.match?(/\Aext\s+extension\s+.+(?:\{)?\s*\z/)
+
+    false
+  end
+
+  def extract_block(lines, start_index)
+    depth = 1
+    middle = nil
+    index = start_index + 1
+
+    while index < lines.length
+      text = lines[index][:text]
+      if lines[start_index][:text].start_with?("ext extension ")
+        return [lines[(start_index + 1)...index], index, nil] if text == "end"
+        index += 1
+        next
+      end
+
+      depth += 1 if block_start?(text)
+
+      if text == "end" || text == "}"
+        depth -= 1
+
+        if depth == 0
+          body = lines[(start_index + 1)...index]
+          return [body, index, middle]
+        end
+
+      elsif text == "else" && depth == 1
+        middle = index
+      end
+
+      index += 1
+    end
+
+    number = lines[start_index][:number]
+
+    raise SyntaxError, "Missing block ending at line #{number}"
+  end
+
+  # ==========================================================
+  # TIMES LOOPS
+  # ==========================================================
+
+  def execute_times(count_source, variable, body, in_function)
+    count = evaluate(count_source)
+
+    unless count.is_a?(Integer)
+      raise TypeError, "times expects an integer"
+    end
+
+    if count < 0 || count > 1_000_000
+      raise RangeError, "times count must be 0..1000000"
+    end
+
+    previous = @variables[variable]
+
+    begin
+      count.times do |i|
+        @variables[variable] = {
+          type: "vi",
+          value: i
+        }
+
+        execute(body, in_function)
+      end
+    ensure
+      if previous
+        @variables[variable] = previous
+      else
+        @variables.delete(variable)
+      end
+    end
+  end
+
+  # ==========================================================
+  # RUBY KEYWORDS
+  # ==========================================================
+
+  def execute_keyword(name, body)
+    ruby_code = body.map { |entry| entry[:raw] }.join("\n")
+
+    @keywords[name] = ruby_code
+
+    # Runs Ruby supplied in the .lang file.
+    # Ruby output is inherited by Rublang.
+    eval(ruby_code, TOPLEVEL_BINDING, "(rublang keyword #{name})")
+  end
+
+  # ==========================================================
+  # EXTENSIONS: RUBY, C, C++
+  # ==========================================================
+
+  def execute_extension_languages(names, body)
+    languages = names.split(",").map(&:strip)
+    supported = ["Ruby", "Ruby Glimmer", "C", "C++"]
+
+    languages.each do |lang|
+      unless supported.include?(lang)
+        raise ArgumentError, "Unknown extension: #{lang}"
+      end
+    end
+
+    sections = {}
+    languages.each { |lang| sections[lang] = [] }
+    current = languages.first
+
+    body.each do |entry|
+      raw = entry[:raw]
+      stripped = raw.strip
+
+      if stripped.end_with?(":")
+        label = stripped.delete_suffix(":")
+        if languages.include?(label)
+          current = label
+          next
+        end
+      end
+
+      sections[current] << raw
+    end
+
+    languages.each do |lang|
+      source = sections[lang].join("\n")
+      next if source.strip.empty?
+
+      case lang
+      when "Ruby"
+        execute_ruby_extension(source, false)
+      when "Ruby Glimmer"
+        execute_ruby_extension(source, true)
+      when "C"
+        compile_extension(source, "gcc", ".c")
+      when "C++"
+        compile_extension(source, "g++", ".cpp")
+      end
+    end
+  end
+
+  def execute_ruby_extension(source, glimmer = false)
+    Dir.mktmpdir("rublang-ruby-") do |dir|
+      path = File.join(dir, "extension.rb")
+
+      if glimmer
+        source = "require 'glimmer-dsl-libui'\ninclude Glimmer\n" + source
+      end
+
+      File.write(path, source)
+
+      success = system("ruby", path)
+
+      unless success
+        raise RuntimeError, "Ruby extension failed"
+      end
+    end
+  end
+
+  def compile_extension(source, compiler, suffix)
+    unless system("which", compiler, out: File::NULL, err: File::NULL)
+      raise LoadError, "#{compiler} not installed"
+    end
+
+    Dir.mktmpdir("rublang-ext-") do |directory|
+      source_path = File.join(directory, "extension#{suffix}")
+      output_path = File.join(directory, "extension")
+
+      File.write(source_path, source)
+
+      stdout, stderr, status = Open3.capture3(
+        compiler, source_path, "-o", output_path
+      )
+
+      unless status.success?
+        raise RuntimeError, "#{compiler} compilation failed:\n#{stderr}"
+      end
+
+      stdout, stderr, status = Open3.capture3(output_path)
+
+      print stdout
+      warn stderr unless stderr.empty?
+
+      unless status.success?
+        raise RuntimeError, "Extension exited with status #{status.exitstatus}"
+      end
+    end
+  end
+
+  # ==========================================================
+  # SOUND
+  # ==========================================================
+
+  def play_sound(frequency, volume)
+    frequency = numeric(frequency)
+    volume = numeric(volume)
+
+    unless frequency.between?(20, 20_000)
+      raise RangeError, "Frequency must be 20..20000"
+    end
+
+    unless volume.between?(0, 1)
+      raise RangeError, "Volume must be 0..1"
+    end
+
+    rate = 44_100
+
+    samples = Array.new(rate / 2) do |i|
+      sample = Math.sin(2 * Math::PI * frequency * i / rate) * [1.0, i/(rate*0.01), (rate/2-i)/(rate*0.02)].min.clamp(0,1)
+      (128 + sample * 127 * volume).round.clamp(0, 255)
+    end.pack("C*")
+
+    if system("which", "aplay", out: File::NULL, err: File::NULL)
+      IO.popen(
+        ["aplay", "-q", "-t", "raw", "-r", rate.to_s, "-f", "U8"],
+        "w"
+      ) do |io|
+        io.write(samples)
+      end
+    else
+      warn "Sound unavailable: install alsa-utils"
+    end
+  end
+
+  # ==========================================================
+  # FILES AND SYSTEM
+  # ==========================================================
 
   def split_args(source)
     return [] if source.strip.empty?
@@ -429,7 +1104,6 @@ class Language
         elsif char == quote
           quote = nil
         end
-
         next
       end
 
@@ -439,12 +1113,10 @@ class Language
       end
 
       case char
-      when "("
+      when "(", "["
         depth += 1
-
-      when ")"
+      when ")", "]"
         depth -= 1
-
       when ","
         if depth == 0
           result << source[start...index].strip
@@ -457,394 +1129,71 @@ class Language
     result
   end
 
-  def play_sound(frequency, volume)
-    frequency = numeric(frequency)
-    volume = numeric(volume)
+  def execute_file_command(command, source)
+    args = split_args(source)
 
-    unless frequency.between?(20, 20_000)
-      raise RangeError, "Frequency must be 20..20000"
-    end
+    case command
+    when "write", "append"
+      check_args("File.#{command}", args, 2)
 
-    unless volume.between?(0, 1)
-      raise RangeError, "Volume must be 0..1"
-    end
+      filename = display_value(args[0]).to_s
+      content = display_value(args[1]).to_s
 
-    if RUBY_PLATFORM.match?(/mswin|mingw/)
-      system(
-        "powershell",
-        "-NoProfile",
-        "-Command",
-        "[console]::Beep(#{frequency.to_i},500)"
-      )
+      if command == "write"
+        File.write(filename, content)
+      else
+        File.open(filename, "a") do |file|
+          file.write(content)
+        end
+      end
 
-    elsif RUBY_PLATFORM.include?("darwin")
-      system("osascript", "-e", "beep")
+    when "read"
+      check_args("File.read", args, 1)
+      puts File.read(evaluate(args[0]).to_s)
+
+    when "delete"
+      check_args("File.delete", args, 1)
+      File.delete(evaluate(args[0]).to_s)
+
+    when "exists"
+      check_args("File.exists", args, 1)
+      puts File.exist?(evaluate(args[0]).to_s)
 
     else
-      rate = 44_100
-
-      bytes = Array.new(rate / 2) do |index|
-        sample = Math.sin(
-          2 * Math::PI * frequency * index / rate
-        )
-
-        (128 + sample * 127 * volume)
-          .round
-          .clamp(0, 255)
-      end.pack("C*")
-
-      if system(
-        "which",
-        "aplay",
-        out: File::NULL,
-        err: File::NULL
-      )
-        IO.popen(
-          [
-            "aplay",
-            "-q",
-            "-t", "raw",
-            "-r", rate.to_s,
-            "-f", "U8"
-          ],
-          "w"
-        ) do |io|
-          io.write(bytes)
-        end
-      else
-        warn "Sound unavailable: install alsa-utils"
-      end
-    end
-
-    nil
-  end
-
-  def extract_block(lines, start_index)
-    depth = 1
-    middle = nil
-    index = start_index + 1
-
-    while index < lines.length
-      text = lines[index][:text]
-
-      if text.match?(/\A(?:if|while|def|namespace|class)\s+/)
-        depth += 1
-      end
-
-      if text == "end"
-        depth -= 1
-
-        if depth == 0
-          body = lines[(start_index + 1)...index]
-          return [body, index, middle]
-        end
-
-      elsif text == "else" && depth == 1
-        middle = index
-      end
-
-      index += 1
-    end
-
-    line_number = lines[start_index][:number]
-
-    raise SyntaxError,
-          "Missing end for block at line #{line_number}"
-  end
-
-  def parameters(source)
-    return [] if source.strip.empty?
-
-    params = source.split(",").map(&:strip)
-
-    valid = params.all? do |param|
-      param.match?(/\A[A-Za-z_]\w*\z/)
-    end
-
-    unless valid && params.uniq == params
-      raise SyntaxError, "Invalid function parameters"
-    end
-
-    params
-  end
-
-  def define_scope(kind, name, body)
-    table = kind == "namespace" ? @namespaces : @classes
-
-    table[name] ||= {}
-
-    index = 0
-
-    while index < body.length
-      line = body[index][:text]
-
-      if line.empty? || line.start_with?("#", "//")
-        index += 1
-        next
-      end
-
-      match = /\Adef\s+([A-Za-z_]\w*)\s*\(([^()]*)\)\z/.match(line)
-
-      unless match
-        raise SyntaxError,
-              "Only methods allowed directly inside #{kind} #{name}"
-      end
-
-      method_name = match[1]
-      params = parameters(match[2])
-
-      method_body, last, middle = extract_block(body, index)
-
-      if middle
-        raise SyntaxError, "Unexpected else in method definition"
-      end
-
-      table[name][method_name] = {
-        params: params,
-        body: method_body
-      }
-
-      index = last + 1
-    end
-
-    nil
-  end
-
-  def scoped_call(owner, separator, method, args)
-    if owner == "GUI" && separator == "::"
-      unless @gui_imported
-        raise NameError, "Import gui first"
-      end
-
-      unless defined?(RublangGUI)
-        raise LoadError, "gui.rb does not define RublangGUI"
-      end
-
-      return RublangGUI.call(method, args)
-    end
-
-    if owner == "time" && separator == "."
-      unless @time_imported
-        raise NameError, "Import time first"
-      end
-
-      case method
-      when "sleep"
-        unless args.length == 1
-          raise ArgumentError, "time.sleep expects 1 argument"
-        end
-
-        seconds = numeric(args[0])
-
-        raise RangeError, "Negative sleep" if seconds < 0
-
-        sleep(seconds)
-        return nil
-      end
-    end
-
-    table = separator == "." ? @namespaces : @classes
-
-    scope = table[owner]
-
-    unless scope
-      kind = separator == "." ? "namespace" : "class"
-
-      raise NameError, "Unknown #{kind} #{owner}"
-    end
-
-    function = scope[method]
-
-    unless function
-      raise NameError,
-            "Unknown method #{owner}#{separator}#{method}"
-    end
-
-    invoke_function(
-      function,
-      args,
-      "#{owner}#{separator}#{method}"
-    )
-  end
-
-  def call_function(name, args)
-    case name
-    when "print"
-      puts(*args)
-      return nil
-
-    when "str"
-      raise ArgumentError, "str expects 1 argument" unless args.length == 1
-      return args[0].to_s
-
-    when "int"
-      raise ArgumentError, "int expects 1 argument" unless args.length == 1
-      return Integer(args[0])
-
-    when "float"
-      raise ArgumentError, "float expects 1 argument" unless args.length == 1
-      return Float(args[0])
-
-    when "len"
-      raise ArgumentError, "len expects 1 argument" unless args.length == 1
-      return args[0].to_s.length
-
-    when "abs"
-      raise ArgumentError, "abs expects 1 argument" unless args.length == 1
-      return numeric(args[0]).abs
-
-    when "min"
-      raise ArgumentError, "min expects 2 arguments" unless args.length == 2
-      return [numeric(args[0]), numeric(args[1])].min
-
-    when "max"
-      raise ArgumentError, "max expects 2 arguments" unless args.length == 2
-      return [numeric(args[0]), numeric(args[1])].max
-
-    when "round"
-      raise ArgumentError, "round expects 1 argument" unless args.length == 1
-      return numeric(args[0]).round
-    end
-
-    function = @functions[name]
-
-    unless function
-      raise NameError, "Unknown function #{name}"
-    end
-
-    invoke_function(function, args, name)
-  end
-
-  def invoke_function(function, args, name)
-    expected = function[:params].length
-
-    unless args.length == expected
-      raise ArgumentError,
-            "#{name} expects #{expected} arguments, got #{args.length}"
-    end
-
-    if @call_depth >= 100
-      raise RangeError, "Function recursion limit reached"
-    end
-
-    previous = @variables
-    @variables = previous.dup
-    @call_depth += 1
-
-    function[:params].zip(args).each do |param, value|
-      @variables[param] = {
-        type: nil,
-        value: value
-      }
-    end
-
-    begin
-      execute(function[:body], true)
-      nil
-
-    rescue ReturnSignal => signal
-      signal.value
-
-    ensure
-      @variables.each do |key, entry|
-        if previous.key?(key) &&
-           !function[:params].include?(key)
-          previous[key] = entry
-        end
-      end
-
-      @variables = previous
-      @call_depth -= 1
+      raise NameError, "Unknown File command #{command}"
     end
   end
 
-  def package_directories
-    directories = []
-
-    if @source_file
-      directories << File.dirname(@source_file)
-    end
-
-    directories << Dir.pwd
-
-    directories.uniq
+  def execute_system(source)
+    command = display_value(source).to_s
+    system(command)
   end
 
-  def import_package(name)
-    return if @imports[name]
-
-    case name
-    when "time"
-      @time_imported = true
-      @imports[name] = true
-      return
-
-    when "gui"
-      unless defined?(RublangGUI)
-        raise LoadError, "GUI engine unavailable"
-      end
-
-      @gui_imported = true
-      @imports[name] = true
-      return
-    end
-
-    unless name.match?(/\A[A-Za-z][A-Za-z0-9_-]*\z/)
-      raise SyntaxError, "Invalid package name #{name}"
-    end
-
-    paths = []
-
-    package_directories.each do |directory|
-      paths << File.join(
-        directory, ".rublang", "packages", "#{name}.lang"
-      )
-
-      paths << File.join(
-        directory, ".rublang", "packages", name, "main.lang"
-      )
-
-      paths << File.join(directory, "#{name}.lang")
-    end
-
-    path = paths.find { |candidate| File.file?(candidate) }
-
-    unless path
-      raise LoadError,
-            "Package not installed: #{name}. Run ruby pkg.rb install ."
-    end
-
-    @imports[name] = true
-
-    begin
-      code = File.read(path)
-      run(code)
-
-    rescue Exception
-      @imports.delete(name)
-      raise
-    end
-
-    nil
-  end
+  # ==========================================================
+  # ERRORS
+  # ==========================================================
 
   def report_error(error, number)
     @error_count += 1
 
-    case error
-    when ZeroDivisionError
-      warn "RublangError [line #{number}]: #{error.message}"
+    prefix =
+      case error
+      when ZeroDivisionError
+        "RublangError"
+      when RangeError
+        "RublangOverflow"
+      when SyntaxError
+        "RublangSyntaxError"
+      else
+        "RublangError"
+      end
 
-    when RangeError
-      warn "RublangOverflow [line #{number}]: #{error.message}"
-
-    when SyntaxError
-      warn "RublangSyntaxError [line #{number}]: #{error.message}"
-
-    else
-      warn "RublangError [line #{number}]: #{error.message}"
-    end
+    warn "#{prefix} [line #{number}]: #{error.message}"
   end
+
+  # ==========================================================
+  # MAIN INTERPRETER
+  # ==========================================================
 
   def execute(lines, in_function = false)
     index = 0
@@ -856,25 +1205,69 @@ class Language
       index += 1
 
       next if line.empty?
-      next if line.start_with?("#", "//")
-
-      @current_line = number
+      next if comment_line?(line)
 
       begin
         case line
 
+        # -----------------------
+        # IMPORT
+        # -----------------------
+
         when /\Aimport\s+([A-Za-z][A-Za-z0-9_-]*)\z/
           import_package(Regexp.last_match(1))
 
+        # -----------------------
+        # TIMES
+        # -----------------------
+
+        when /\Atimes\s*\((.+)\)\s+as\s+([A-Za-z_]\w*)\s*\{\s*\z/
+          count_source, variable = Regexp.last_match.captures
+
+          body, last, middle = extract_block(lines, index - 1)
+          raise SyntaxError, "Unexpected else" if middle
+
+          execute_times(count_source, variable, body, in_function)
+          index = last + 1
+
+        # -----------------------
+        # KEYWORD
+        # -----------------------
+
+        when /\Akeyword\s*\((.+)\)\s*\{\s*\z/
+          name = evaluate(Regexp.last_match(1)).to_s
+
+          body, last, middle = extract_block(lines, index - 1)
+          raise SyntaxError, "Unexpected else" if middle
+
+          execute_keyword(name, body)
+          index = last + 1
+
+        # -----------------------
+        # EXTENSION
+        # -----------------------
+
+        when /\Aext\s+extension\s+"([^"]+)"\s*\{?\s*\z/
+          languages = Regexp.last_match(1)
+
+          body, last, middle = extract_block(lines, index - 1)
+          raise SyntaxError, "Unexpected else" if middle
+
+          execute_extension_languages(languages, body)
+          index = last + 1
+
+        # -----------------------
+        # STANDARD BLOCKS
+        # -----------------------
+
         when /\A(?:if|while|def|namespace|class)\s+/
-          block_start = index - 1
-          body, last, middle = extract_block(lines, block_start)
+          body, last, middle = extract_block(lines, index - 1)
 
           if line.start_with?("namespace ", "class ")
             kind, name = line.split(/\s+/, 2)
 
             unless name.match?(/\A[A-Za-z_]\w*\z/)
-              raise SyntaxError, "Invalid scope name #{name}"
+              raise SyntaxError, "Invalid scope name"
             end
 
             define_scope(kind, name, body)
@@ -906,15 +1299,13 @@ class Language
             end
 
           else
-            match = /\Adef\s+([A-Za-z_]\w*)\s*\(([^()]*)\)\z/.match(line)
+            match = /\Adef\s+([A-Za-z_]\w*)\s*\(([^()]*)\)\s*\z/.match(line)
 
             unless match
               raise SyntaxError, "Expected def name(args)"
             end
 
-            if middle
-              raise SyntaxError, "Unexpected else"
-            end
+            raise SyntaxError, "Unexpected else" if middle
 
             @functions[match[1]] = {
               params: parameters(match[2]),
@@ -924,8 +1315,16 @@ class Language
 
           index = last + 1
 
-        when "end", "else"
+        # -----------------------
+        # BLOCK ENDINGS
+        # -----------------------
+
+        when "end", "}", "else"
           raise SyntaxError, "Unexpected #{line}"
+
+        # -----------------------
+        # RETURN
+        # -----------------------
 
         when /\Areturn(?:\s+(.+))?\z/
           unless in_function
@@ -937,43 +1336,81 @@ class Language
 
           raise ReturnSignal.new(value)
 
-        when /\Astdin::c\s*>>\s*([A-Za-z_]\w*)\z/
-          name = Regexp.last_match(1)
-
-          type = @variables.dig(name, :type) || "vs"
-
-          value = convert_input(
-            read_input("> "),
-            type
-          )
-
-          assign(name, value, type)
+        # -----------------------
+        # OUTPUT
+        # -----------------------
 
         when /\Astdout::c\s*<<\s*(.+)\z/
-          puts evaluate(Regexp.last_match(1))
+          puts display_value(Regexp.last_match(1))
 
         when /\Astdout::print\s*<<\s*(.+)\z/
-          print evaluate(Regexp.last_match(1))
+          print display_value(Regexp.last_match(1))
           STDOUT.flush
 
+        # -----------------------
+        # INPUT
+        # -----------------------
+
+        when /\Astdin::c\s*>>\s*([A-Za-z_]\w*)\z/
+          name = Regexp.last_match(1)
+          type = @variables.dig(name, :type) || "vs"
+
+          value = convert_input(read_input("> "), type)
+          assign(name, value, type)
+
+        # -----------------------
+        # SOUND
+        # -----------------------
+
         when /\Asound::play\s*\((.*)\)\z/
-          pieces = split_args(Regexp.last_match(1))
+          parts = split_args(Regexp.last_match(1))
+          check_args("sound::play", parts, 2)
 
-          unless pieces.length == 2
-            raise ArgumentError,
-                  "sound::play(freq, volume)"
-          end
-
-          frequency = evaluate(pieces[0])
-          volume = evaluate(pieces[1])
+          frequency = evaluate(parts[0])
+          volume = evaluate(parts[1])
 
           play_sound(frequency, volume)
 
-        when /\A(vll|vs|vf|vi|vb|vl)\s+([A-Za-z_]\w*)\s*=\s*(.+)\z/
+        # -----------------------
+        # FILE COMMANDS
+        # -----------------------
+
+        when /\AFile\.(write|append|read|delete|exists)\s+(.+)\z/
+          command, source = Regexp.last_match.captures
+          execute_file_command(command, source)
+
+        # -----------------------
+        # SYSTEM
+        # -----------------------
+
+        when /\Asystem\s+(.+)\z/
+          execute_system(Regexp.last_match(1))
+
+        # -----------------------
+        # VARIABLES
+        # -----------------------
+
+        when /\A(vll|vs|vf|vi|vb|vl|va)\s+([A-Za-z_]\w*)\s*=\s*(.+)\z/
           type, name, source = Regexp.last_match.captures
 
           value = assignment_value(source, type)
           assign(name, value, type)
+
+        # -----------------------
+        # ARRAY ITEM ASSIGNMENT
+        # -----------------------
+
+        when /\A([A-Za-z_]\w*)\s*\[(.+)\]\s*=\s*(.+)\z/
+          name, index_source, source = Regexp.last_match.captures
+
+          array_index = evaluate(index_source)
+          value = evaluate(source)
+
+          set_array_item(name, array_index, value)
+
+        # -----------------------
+        # EXISTING VARIABLE
+        # -----------------------
 
         when /\A([A-Za-z_]\w*)\s*=\s*(.+)\z/
           name, source = Regexp.last_match.captures
@@ -987,12 +1424,15 @@ class Language
 
           assign(name, value)
 
+        # -----------------------
+        # FUNCTION CALL
+        # -----------------------
+
         when /\A[A-Za-z_]\w*(?:(?:\.|::)[A-Za-z_]\w*)?\s*\(.*\)\z/
           evaluate(line)
 
         else
-          raise SyntaxError,
-                "Unknown command: #{line}"
+          raise SyntaxError, "Unknown command: #{line}"
         end
 
       rescue ReturnSignal
@@ -1007,11 +1447,22 @@ class Language
     nil
   end
 
+  # ==========================================================
+  # RUN
+  # ==========================================================
+
   def run(code)
-    lines = code.each_line.with_index(1).map do |line, number|
+    # Keep original source for raw Ruby/C/C++ blocks.
+    original = code.each_line.to_a
+
+    # Mask comments without changing line numbers.
+    cleaned = remove_comments(code).each_line.to_a
+
+    lines = cleaned.each_with_index.map do |line, index|
       {
         text: line.strip,
-        number: number
+        raw: original[index].to_s.chomp,
+        number: index + 1
       }
     end
 
@@ -1023,15 +1474,24 @@ class Language
       raise LoadError, "File not found: #{path}"
     end
 
+    previous = @source_file
     @source_file = File.expand_path(path)
 
-    run(File.read(@source_file))
+    begin
+      run(File.read(@source_file))
+    ensure
+      @source_file = previous
+    end
   end
 
   def errors
     @error_count
   end
 end
+
+# ==========================================================
+# ENTRY POINT
+# ==========================================================
 
 if __FILE__ == $PROGRAM_NAME
   begin
