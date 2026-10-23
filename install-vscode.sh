@@ -132,6 +132,6 @@ if ! command -v code >/dev/null; then
   echo "VS Code CLI not found. Extension source is at $REPO in vscode-extension."
   exit 0
 fi
-npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository
-code --install-extension rublang-1.0.0.vsix
+npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository --no-git-tag-version
+code --install-extension rublang-1.1.0.vsix --force
 echo "Rublang installed in local VS Code. Public Marketplace listing requires publishing separately."
