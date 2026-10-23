@@ -1,0 +1,46 @@
+{
+  "name": "rublang",
+  "displayName": "Rublang",
+  "description": "Syntax highlighting and Run File command for the Rublang programming language.",
+  "version": "1.0.0",
+  "publisher": "samwise1776",
+  "license": "MIT",
+  "engines": { "vscode": "^1.85.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:rublang", "onCommand:rublang.runFile"],
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [{
+      "id": "rublang",
+      "aliases": ["Rublang", "rublang"],
+      "extensions": [".lang"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "rublang",
+      "scopeName": "source.rublang",
+      "path": "./syntaxes/rublang.tmLanguage.json"
+    }],
+    "commands": [{
+      "command": "rublang.runFile",
+      "title": "Rublang: Run Current File"
+    }],
+    "menus": {
+      "editor/title": [{
+        "command": "rublang.runFile",
+        "when": "resourceLangId == rublang",
+        "group": "navigation"
+      }]
+    },
+    "configuration": {
+      "title": "Rublang",
+      "properties": {
+        "rublang.interpreterPath": {
+          "type": "string",
+          "default": "app.rb",
+          "description": "Path to the Rublang interpreter (app.rb); relative paths resolve from the workspace."
+        }
+      }
+    }
+  }
+}
