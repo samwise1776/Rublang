@@ -1,56 +1,36 @@
 {
   "name": "rublang",
   "displayName": "Rublang",
-  "description": "Rublang syntax highlighting, custom editor colors, autocomplete suggestions and Run File command.",
-  "version": "1.1.0",
+  "description": "Syntax highlighting and Run File command for the Rublang programming language.",
+  "version": "1.0.0",
   "publisher": "samwise1776",
   "license": "MIT",
-  "engines": {
-    "vscode": "^1.85.0"
-  },
+  "engines": { "vscode": "^1.85.0" },
   "main": "./extension.js",
-  "activationEvents": [
-    "onLanguage:rublang",
-    "onCommand:rublang.runFile"
-  ],
-  "categories": [
-    "Programming Languages"
-  ],
+  "activationEvents": ["onLanguage:rublang", "onCommand:rublang.runFile"],
+  "categories": ["Programming Languages"],
   "contributes": {
-    "languages": [
-      {
-        "id": "rublang",
-        "aliases": [
-          "Rublang",
-          "rublang"
-        ],
-        "extensions": [
-          ".lang"
-        ],
-        "configuration": "./language-configuration.json"
-      }
-    ],
-    "grammars": [
-      {
-        "language": "rublang",
-        "scopeName": "source.rublang",
-        "path": "./syntaxes/rublang.tmLanguage.json"
-      }
-    ],
-    "commands": [
-      {
-        "command": "rublang.runFile",
-        "title": "Rublang: Run Current File"
-      }
-    ],
+    "languages": [{
+      "id": "rublang",
+      "aliases": ["Rublang", "rublang"],
+      "extensions": [".lang"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "rublang",
+      "scopeName": "source.rublang",
+      "path": "./syntaxes/rublang.tmLanguage.json"
+    }],
+    "commands": [{
+      "command": "rublang.runFile",
+      "title": "Rublang: Run Current File"
+    }],
     "menus": {
-      "editor/title": [
-        {
-          "command": "rublang.runFile",
-          "when": "resourceLangId == rublang",
-          "group": "navigation"
-        }
-      ]
+      "editor/title": [{
+        "command": "rublang.runFile",
+        "when": "resourceLangId == rublang",
+        "group": "navigation"
+      }]
     },
     "configuration": {
       "title": "Rublang",
