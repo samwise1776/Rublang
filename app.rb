@@ -607,6 +607,106 @@ class Language
     when "range"
       check_args(name, args, 2)
       return (Integer(args[0])..Integer(args[1])).to_a
+
+    when "factorial"
+      check_args(name, args, 1)
+      n = Integer(args[0])
+      raise RangeError, "factorial requires 0..10000" unless (0..10_000).cover?(n)
+      return (1..n).reduce(1, :*)
+
+    when "pow"
+      check_args(name, args, 2)
+      return numeric(args[0]) ** numeric(args[1])
+
+    when "sqrt"
+      check_args(name, args, 1)
+      return Math.sqrt(numeric(args[0]))
+
+    when "floor"
+      check_args(name, args, 1)
+      return numeric(args[0]).floor
+
+    when "ceil"
+      check_args(name, args, 1)
+      return numeric(args[0]).ceil
+
+    when "sum"
+      check_args(name, args, 1)
+      raise TypeError, "Expected array" unless args[0].is_a?(Array)
+      return args[0].reduce(0) { |total, value| total + numeric(value) }
+
+    when "average"
+      check_args(name, args, 1)
+      raise TypeError, "Expected nonempty array" unless args[0].is_a?(Array) && !args[0].empty?
+      return args[0].reduce(0.0) { |total, value| total + numeric(value) } / args[0].length
+
+    when "sort"
+      check_args(name, args, 1)
+      raise TypeError, "Expected array" unless args[0].is_a?(Array)
+      return args[0].sort
+
+    when "unique"
+      check_args(name, args, 1)
+      raise TypeError, "Expected array" unless args[0].is_a?(Array)
+      return args[0].uniq
+
+    when "join"
+      check_args(name, args, 2)
+      raise TypeError, "Expected array" unless args[0].is_a?(Array)
+      return args[0].join(args[1].to_s)
+
+    when "split"
+      check_args(name, args, 2)
+      return args[0].to_s.split(args[1].to_s)
+
+    when "replace"
+      check_args(name, args, 3)
+      return args[0].to_s.gsub(args[1].to_s, args[2].to_s)
+
+    when "upper"
+      check_args(name, args, 1)
+      return args[0].to_s.upcase
+
+    when "lower"
+      check_args(name, args, 1)
+      return args[0].to_s.downcase
+
+    when "trim"
+      check_args(name, args, 1)
+      return args[0].to_s.strip
+
+    when "contains"
+      check_args(name, args, 2)
+      return args[0].respond_to?(:include?) && args[0].include?(args[1])
+
+    when "starts_with"
+      check_args(name, args, 2)
+      return args[0].to_s.start_with?(args[1].to_s)
+
+    when "ends_with"
+      check_args(name, args, 2)
+      return args[0].to_s.end_with?(args[1].to_s)
+
+    when "json_encode"
+      check_args(name, args, 1)
+      return JSON.generate(args[0])
+
+    when "json_decode"
+      check_args(name, args, 1)
+      return JSON.parse(args[0].to_s)
+
+    when "type_of"
+      check_args(name, args, 1)
+      return case args[0]
+             when NilClass then "nil"
+             when TrueClass, FalseClass then "bool"
+             when Integer then "int"
+             when Float then "float"
+             when String then "string"
+             when Array then "array"
+             when Hash then "object"
+             else args[0].class.to_s
+             end
     end
 
     function = @functions[name]
