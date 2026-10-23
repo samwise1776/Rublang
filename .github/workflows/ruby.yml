@@ -1,0 +1,19 @@
+name: Ruby syntax checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ruby: ['3.2', '3.3', '3.4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - name: Check syntax
+        run: ruby test/smoke.rb
