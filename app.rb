@@ -608,6 +608,12 @@ class Language
       check_args(name, args, 2)
       return (Integer(args[0])..Integer(args[1])).to_a
 
+    when "mkdir"
+      check_args(name, args, 1)
+      path = args[0].to_s
+      FileUtils.mkdir_p(path)
+      return path
+
     when "factorial"
       check_args(name, args, 1)
       n = Integer(args[0])
